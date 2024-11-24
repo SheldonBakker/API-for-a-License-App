@@ -15,6 +15,7 @@ const prpdRoutes = require("./routes/prpd");
 const vehiclesRoutes = require("./routes/vehicles");
 const workRoutes = require("./routes/work");
 const sanitizeHtml = require("sanitize-html");
+const { initializeDatabase } = require("./config/database");
 
 const app = express();
 
@@ -87,43 +88,60 @@ app.use("/api/", limiter);
 // Logging
 app.use(morgan("dev"));
 
-// CORS configuration
-const FRONTEND_URL = process.env.FRONTEND_URL;
-app.use(
-  cors({
-    origin: [FRONTEND_URL],
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "CSRF-Token",
-      "X-CSRF-Token",
-    ],
-    exposedHeaders: ["Content-Range", "X-Content-Range"],
-    maxAge: 600, // Cache preflight requests for 10 minutes
-  })
-);
+// Update CORS configuration
+const corsOptions = {
+  origin:
+    process.env.NODE_ENV === "production"
+      ? [process.env.FRONTEND_URL]
+      : ["http://localhost:1000", "http://127.0.0.1:1000"],
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "CSRF-Token",
+    "X-CSRF-Token",
+  ],
+  exposedHeaders: ["Content-Range", "X-Content-Range"],
+  maxAge: 600, // Cache preflight requests for 10 minutes
+};
+
+app.use(cors(corsOptions));
 
 app.use(express.json({ limit: "10kb" })); // Limit payload size
 
-// Move CSRF setup before routes
+// Move cookie parser and CSRF setup before routes
 app.use(cookieParser());
 
-// Setup CSRF protection
+// Update CSRF protection configuration
 const csrfProtection = csrf({
   cookie: {
     key: "_csrf",
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: process.env.NODE_ENV === "production" ? "strict" : "lax",
+    domain:
+      process.env.NODE_ENV === "production"
+        ? process.env.COOKIE_DOMAIN
+        : "localhost",
   },
 });
 
-// Create endpoint to get CSRF token - this needs to be before other routes
+// Update CSRF token endpoint
 app.get("/api/csrf-token", csrfProtection, (req, res) => {
   try {
-    res.json({ csrfToken: req.csrfToken() });
+    res
+      .status(200)
+      .cookie("XSRF-TOKEN", req.csrfToken(), {
+        secure: process.env.NODE_ENV === "production",
+        sameSite: process.env.NODE_ENV === "production" ? "strict" : "lax",
+        httpOnly: false,
+        domain:
+          process.env.NODE_ENV === "production"
+            ? process.env.COOKIE_DOMAIN
+            : "localhost",
+      })
+      .json({ csrfToken: req.csrfToken() });
   } catch (error) {
     console.error("CSRF Token Generation Error:", error);
     res.status(500).json({ message: "Failed to generate CSRF token" });
@@ -154,6 +172,18 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+
+// Wrap server startup in async function
+const startServer = async () => {
+  try {
+    await initializeDatabase();
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+    });
+  } catch (error) {
+    console.error("Failed to start server:", error);
+    process.exit(1);
+  }
+};
+
+startServer();

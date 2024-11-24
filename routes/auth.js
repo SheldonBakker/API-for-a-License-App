@@ -12,27 +12,7 @@ const csrf = require("csurf");
 const helmet = require("helmet");
 const getVerificationEmailTemplate = require("../templates/verificationEmail");
 const sanitizeHtml = require("sanitize-html");
-
-const transporter = nodemailer.createTransport({
-  host: process.env.EMAIL_HOST,
-  port: parseInt(process.env.EMAIL_PORT) || 587,
-  secure: process.env.EMAIL_SECURE === "false",
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD,
-  },
-  tls: {
-    rejectUnauthorized: process.env.NODE_ENV === "production",
-  },
-});
-
-transporter.verify(function (error, success) {
-  if (error) {
-    console.error("Email transporter verification failed:", error);
-  } else {
-    console.log("Email server is ready to send messages");
-  }
-});
+const emailService = require("../config/email");
 
 // Add rate limiter for login attempts
 const loginRateLimiter = rateLimit({
@@ -98,11 +78,41 @@ router.post("/unblock-ip", authMiddleware, async (req, res) => {
   res.json({ message: "IP blocking temporarily disabled" });
 });
 
+const checkPasswordBreach = async (req, res, next) => {
+  const { password } = req.body;
+  try {
+    const hash = crypto
+      .createHash("sha1")
+      .update(password)
+      .digest("hex")
+      .toUpperCase();
+    const prefix = hash.slice(0, 5);
+    const suffix = hash.slice(5);
+
+    const response = await fetch(
+      `https://api.pwnedpasswords.com/range/${prefix}`
+    );
+    const text = await response.text();
+
+    if (text.includes(suffix)) {
+      return res.status(400).json({
+        message:
+          "This password has been found in known data breaches. Please choose a different password.",
+      });
+    }
+    next();
+  } catch (error) {
+    next();
+  }
+};
+
+// Now we can use it in the registration route
 router.post(
   "/register",
   registrationLimiter,
   csrfProtection,
   passwordValidation,
+  checkPasswordBreach,
   body("email").isEmail().normalizeEmail(),
   async (req, res) => {
     // Validate request
@@ -141,10 +151,9 @@ router.post(
         [email, hashedPassword, verificationToken, tokenExpiry, false]
       );
 
-      // Send verification email
+      // Send verification email using the email service
       const verificationUrl = `${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}`;
-      await transporter.sendMail({
-        from: process.env.EMAIL_USER,
+      await emailService.sendMail({
         to: email,
         subject: "Verify your email address",
         html: getVerificationEmailTemplate(verificationUrl),
@@ -178,41 +187,12 @@ const sanitizeInput = (req, res, next) => {
   next();
 };
 
-const checkPasswordBreach = async (req, res, next) => {
-  const { password } = req.body;
-  try {
-    const hash = crypto
-      .createHash("sha1")
-      .update(password)
-      .digest("hex")
-      .toUpperCase();
-    const prefix = hash.slice(0, 5);
-    const suffix = hash.slice(5);
-
-    const response = await fetch(
-      `https://api.pwnedpasswords.com/range/${prefix}`
-    );
-    const text = await response.text();
-
-    if (text.includes(suffix)) {
-      return res.status(400).json({
-        message:
-          "This password has been found in known data breaches. Please choose a different password.",
-      });
-    }
-    next();
-  } catch (error) {
-    next();
-  }
-};
-
 router.post(
   "/login",
   loginRateLimiter,
   csrfProtection,
   checkIPBlocked,
   sanitizeInput,
-  checkPasswordBreach,
   body("email").isEmail().normalizeEmail(),
   async (req, res) => {
     const errors = validationResult(req);

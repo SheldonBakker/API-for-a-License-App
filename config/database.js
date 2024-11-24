@@ -1,62 +1,146 @@
-const mysql = require("mysql2");
-const retry = require("retry"); // You'll need to install this: npm install retry
+const mysql = require("mysql2/promise");
+const retry = require("retry");
 
-// Create a function to handle connection with retries
-function createPoolWithRetry() {
+const dbConfig = {
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT) || 10,
+  queueLimit: parseInt(process.env.DB_QUEUE_LIMIT) || 0,
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 10000,
+  connectTimeout: 30000, // 30 seconds
+  maxIdle: 10,
+  idleTimeout: 60000, // 60 seconds
+  port: parseInt(process.env.DB_PORT) || 3306,
+};
+
+let pool = null;
+
+const createPool = () => {
+  if (!pool) {
+    pool = mysql.createPool(dbConfig);
+
+    pool.on("connection", (connection) => {
+      console.log("New database connection established");
+
+      connection.on("error", (err) => {
+        console.error("Database connection error:", err);
+        if (err.code === "PROTOCOL_CONNECTION_LOST") {
+          pool = null; // Force pool recreation
+        }
+      });
+    });
+
+    pool.on("error", (err) => {
+      console.error("Pool error:", err);
+      if (
+        err.code === "POOL_CLOSED" ||
+        err.code === "PROTOCOL_CONNECTION_LOST"
+      ) {
+        pool = null;
+      }
+    });
+  }
+  return pool;
+};
+
+const query = async (sql, params = []) => {
   const operation = retry.operation({
-    retries: 5,
+    retries: 3,
     factor: 2,
     minTimeout: 2000,
-    maxTimeout: 60000,
+    maxTimeout: 10000,
   });
 
   return new Promise((resolve, reject) => {
     operation.attempt(async (currentAttempt) => {
       try {
-        const pool = mysql.createPool({
-          host: process.env.DB_HOST,
-          user: process.env.DB_USER,
-          password: process.env.DB_PASSWORD,
-          database: process.env.DB_NAME,
-          waitForConnections: process.env.DB_WAIT_FOR_CONNECTIONS === "true",
-          connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT) || 5,
-          queueLimit: parseInt(process.env.DB_QUEUE_LIMIT) || 0,
-          connectTimeout: parseInt(process.env.DB_CONNECT_TIMEOUT) || 30000,
-          acquireTimeout: 30000,
-          timeout: 60000,
-          enableKeepAlive: true,
-          keepAliveInitialDelay: 0,
+        const currentPool = createPool();
+        const connection = await currentPool.getConnection();
+
+        try {
+          console.log(`Executing query (attempt ${currentAttempt}):`, sql);
+          const [results] = await connection.query(sql, params);
+          connection.release();
+          resolve(results);
+        } catch (queryError) {
+          connection.release();
+          throw queryError;
+        }
+      } catch (error) {
+        console.error(`Query attempt ${currentAttempt} failed:`, {
+          error: error.message,
+          code: error.code,
+          sql: sql,
         });
 
-        // Test the connection
-        pool.getConnection((err, connection) => {
-          if (err) {
-            console.error(`Connection attempt ${currentAttempt} failed:`, err);
-            if (operation.retry(err)) {
-              console.log(
-                `Retrying connection... (Attempt ${currentAttempt + 1})`
-              );
-              return;
-            }
-            reject(operation.mainError());
-          } else {
-            console.log("Database connection successful!");
-            connection.release();
-            resolve(pool);
-          }
-        });
-      } catch (err) {
-        if (operation.retry(err)) {
-          console.log(`Retrying connection... (Attempt ${currentAttempt + 1})`);
+        // Force pool recreation on specific errors
+        if (
+          error.code === "PROTOCOL_CONNECTION_LOST" ||
+          error.code === "ETIMEDOUT" ||
+          error.code === "ECONNREFUSED"
+        ) {
+          pool = null;
+        }
+
+        if (operation.retry(error)) {
           return;
         }
         reject(operation.mainError());
       }
     });
   });
-}
+};
 
-// Export the connection function
+const testConnection = async () => {
+  try {
+    const result = await query("SELECT 1 as test");
+    const currentPool = createPool();
+
+    console.log("\x1b[32m%s\x1b[0m", "✓ Database Connection Status:");
+    console.table({
+      status: "Connected",
+      database: dbConfig.database,
+      host: dbConfig.host,
+      port: dbConfig.port,
+      activeConnections: currentPool.pool.activeConnections(),
+      idleConnections: currentPool.pool.idleConnections(),
+      totalConnections: currentPool.pool.totalConnections(),
+    });
+
+    return true;
+  } catch (error) {
+    console.log("\x1b[31m%s\x1b[0m", "✗ Database Connection Error:");
+    console.error({
+      status: "Failed",
+      message: error.message,
+      code: error.code,
+      host: dbConfig.host,
+      port: dbConfig.port,
+    });
+
+    return false;
+  }
+};
+
+const initializeDatabase = async () => {
+  console.log("Initializing database connection...");
+  const isConnected = await testConnection();
+
+  if (!isConnected) {
+    console.error("Failed to initialize database connection");
+    process.exit(1); // Exit the process if database connection fails
+  }
+
+  return createPool();
+};
+
 module.exports = {
-  createPoolWithRetry,
+  query,
+  testConnection,
+  createPool,
+  initializeDatabase,
 };
